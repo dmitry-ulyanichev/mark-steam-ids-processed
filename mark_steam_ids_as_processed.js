@@ -1,10 +1,27 @@
 const fs = require('fs').promises;
+const express = require('express');
 
 // Configuration
 const API_ENDPOINT = 'https://kuchababok.online/en/links/api/mark-steamid-processed/';
 const API_KEY = 'fa46kPOVnHT2a4aFmQS11dd70290'; // Replace with your actual API key
 const JSON_FILE_PATH = 'unique_ids.json';
 const DELAY_BETWEEN_REQUESTS = 1000; // 1 second delay between requests (adjust as needed)
+const PORT = process.env.PORT || 3000;
+
+// Create Express app for health checks only
+const app = express();
+
+// Processing statistics
+let stats = {
+    startTime: null,
+    totalIds: 0,
+    processed: 0,
+    successful: 0,
+    failed: 0,
+    currentId: null,
+    isRunning: false,
+    errors: []
+};
 
 // Helper function to add delay
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -73,26 +90,37 @@ async function processAllSteamIds() {
         
         console.log(`\nTotal Steam IDs to process: ${allSteamIds.length}\n`);
         
-        // Process each Steam ID
-        const results = {
-            successful: 0,
-            failed: 0,
-            errors: []
-        };
+        // Update stats
+        stats.startTime = new Date();
+        stats.totalIds = allSteamIds.length;
+        stats.processed = 0;
+        stats.successful = 0;
+        stats.failed = 0;
+        stats.isRunning = true;
+        stats.errors = [];
         
+        // Process each Steam ID
         for (let i = 0; i < allSteamIds.length; i++) {
             const steamId = allSteamIds[i];
+            stats.currentId = steamId;
+            stats.processed = i + 1;
+            
             console.log(`Processing ${i + 1}/${allSteamIds.length}: ${steamId}`);
             
             const result = await markSteamIdProcessed(steamId);
             
             if (result.success) {
-                results.successful++;
+                stats.successful++;
             } else {
-                results.failed++;
-                results.errors.push({
+                stats.failed++;
+                // Only keep last 10 errors to prevent memory issues
+                if (stats.errors.length >= 10) {
+                    stats.errors.shift();
+                }
+                stats.errors.push({
                     steamId: result.steamId,
-                    error: result.error
+                    error: result.error,
+                    timestamp: new Date().toISOString()
                 });
             }
             
@@ -102,21 +130,32 @@ async function processAllSteamIds() {
             }
         }
         
+        // Processing complete
+        stats.isRunning = false;
+        stats.currentId = null;
+        
         // Print summary
         console.log('\n📊 Processing Summary:');
-        console.log(`✅ Successful: ${results.successful}`);
-        console.log(`❌ Failed: ${results.failed}`);
+        console.log(`✅ Successful: ${stats.successful}`);
+        console.log(`❌ Failed: ${stats.failed}`);
+        console.log(`⏱️ Duration: ${new Date() - stats.startTime}ms`);
         
-        if (results.errors.length > 0) {
-            console.log('\n❌ Errors:');
-            results.errors.forEach(error => {
+        if (stats.errors.length > 0) {
+            console.log('\n❌ Recent Errors:');
+            stats.errors.forEach(error => {
                 console.log(`  - ${error.steamId}: ${error.error}`);
             });
         }
         
         console.log('\n🎉 Processing complete!');
         
+        // Keep the service alive after processing
+        console.log('📡 Service will continue running for health checks...');
+        
     } catch (error) {
+        stats.isRunning = false;
+        stats.currentId = null;
+        
         if (error.code === 'ENOENT') {
             console.error(`❌ File not found: ${JSON_FILE_PATH}`);
         } else if (error instanceof SyntaxError) {
@@ -124,16 +163,96 @@ async function processAllSteamIds() {
         } else {
             console.error(`❌ Unexpected error: ${error.message}`);
         }
-        process.exit(1);
+        
+        // Add error to stats
+        stats.errors.push({
+            error: error.message,
+            timestamp: new Date().toISOString(),
+            fatal: true
+        });
     }
 }
 
-// Run the script
-if (require.main === module) {
-    processAllSteamIds().catch(error => {
-        console.error('❌ Script failed:', error.message);
-        process.exit(1);
+// Health check endpoint for Render
+app.get('/health', (req, res) => {
+    const uptime = process.uptime();
+    const uptimeFormatted = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${Math.floor(uptime % 60)}s`;
+    
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: uptimeFormatted,
+        processing: {
+            isRunning: stats.isRunning,
+            currentId: stats.currentId,
+            progress: stats.totalIds > 0 ? `${stats.processed}/${stats.totalIds} (${Math.round((stats.processed / stats.totalIds) * 100)}%)` : '0/0',
+            successful: stats.successful,
+            failed: stats.failed,
+            startTime: stats.startTime,
+            recentErrors: stats.errors.slice(-3) // Show only last 3 errors
+        }
     });
-}
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        message: 'Steam ID Processor Service',
+        status: 'running',
+        processing: stats.isRunning ? 'active' : 'idle',
+        progress: stats.totalIds > 0 ? `${stats.processed}/${stats.totalIds}` : 'not started'
+    });
+});
+
+// Detailed status endpoint
+app.get('/status', (req, res) => {
+    res.json({
+        processing: {
+            isRunning: stats.isRunning,
+            currentId: stats.currentId,
+            totalIds: stats.totalIds,
+            processed: stats.processed,
+            successful: stats.successful,
+            failed: stats.failed,
+            startTime: stats.startTime,
+            progress: stats.totalIds > 0 ? Math.round((stats.processed / stats.totalIds) * 100) : 0
+        },
+        system: {
+            uptime: process.uptime(),
+            timestamp: new Date().toISOString(),
+            memoryUsage: process.memoryUsage()
+        },
+        recentErrors: stats.errors
+    });
+});
+
+// Start the HTTP server first
+app.listen(PORT, () => {
+    console.log(`🚀 Steam ID Processor service running on port ${PORT}`);
+    console.log(`📡 Health check: http://localhost:${PORT}/health`);
+    console.log(`📊 Status: http://localhost:${PORT}/status`);
+    console.log(`⏳ Starting processing in 5 seconds...`);
+    
+    // Start processing after a short delay to ensure server is ready
+    setTimeout(() => {
+        processAllSteamIds().catch(error => {
+            console.error('❌ Processing failed:', error.message);
+            // Don't exit - keep server alive for health checks
+        });
+    }, 5000);
+});
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('🛑 Received SIGTERM, shutting down gracefully...');
+    stats.isRunning = false;
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('🛑 Received SIGINT, shutting down gracefully...');
+    stats.isRunning = false;
+    process.exit(0);
+});
 
 module.exports = { markSteamIdProcessed, processAllSteamIds };
